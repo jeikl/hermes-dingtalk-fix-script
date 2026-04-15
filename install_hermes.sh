@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Hermes Agent 安装脚本（内置钉钉修复版）- 已修复语法错误
+# Hermes Agent 安装脚本（内置钉钉修复版）
 # =============================================================================
 # 保留官方安装逻辑不变，安装完成后自动应用钉钉/watch_pattern/cron 修复
 #
@@ -33,7 +33,7 @@ log_error() { echo -e "${RED}✗${NC} $1"; }
 HERMES_HOME="$HOME/.hermes"
 INSTALL_DIR="${HERMES_INSTALL_DIR:-$HERMES_HOME/hermes-agent}"
 
-# 官方脚本地址
+# 官方脚本地址（备用，如需要可替换为你的 gist raw 地址）
 OFFICIAL_INSTALL_URL="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
 
 # 临时目录
@@ -72,6 +72,8 @@ run_official_install() {
     log_info "执行官方安装（安装到 $INSTALL_DIR）..."
     echo ""
 
+    # 将所有参数透传给官方脚本
+    # 如果设置了 HERMES_INSTALL_DIR，使用 --dir 参数
     if [ -n "$HERMES_INSTALL_DIR" ]; then
         bash "$install_script" --dir "$HERMES_INSTALL_DIR" "$@"
     else
@@ -120,7 +122,7 @@ apply_fixes() {
     }
 
     # ----- dingtalk.py -----
-    patch_file "gateway/platforms/dingtalk.py" "$(cat << 'EOF'
+    patch_file "gateway/platforms/dingtalk.py" "$(cat <<'EOF'
 --- a/gateway/platforms/dingtalk.py
 +++ b/gateway/platforms/dingtalk.py
 @@ -27,11 +27,14 @@
@@ -133,9 +135,9 @@ apply_fixes() {
      DINGTALK_STREAM_AVAILABLE = True
  except ImportError:
      DINGTALK_STREAM_AVAILABLE = False
-     dingtalk_stream = None
-+    CallbackHandler = object
-+    AckMessage = None
+     dingtalk_stream = None  # type: ignore[assignment]
++    CallbackHandler = object  # type: ignore[assignment, misc]
++    AckMessage = None  # type: ignore[assignment]
 
  try:
      import httpx
@@ -162,6 +164,7 @@ apply_fixes() {
          if isinstance(text, dict):
              content = text.get("content", "").strip()
 +        elif hasattr(text, "content"):
++            # TextContent object (from dingtalk-stream SDK) - access .content directly
 +            content = text.content.strip() if text.content else ""
          else:
              content = str(text).strip()
@@ -211,8 +214,10 @@ apply_fixes() {
 +            ack.code = AckMessage.STATUS_OK
 +            return ack
 +
++        # Parse ChatbotMessage from callback data
 +        incoming_message = ChatbotMessage.from_dict(callback_message.data)
 +
++        # Fire and forget - schedule async handler on the event loop without blocking.
 +        asyncio.run_coroutine_threadsafe(
 +            self._adapter._on_message(incoming_message), loop
 +        )
@@ -228,7 +233,7 @@ EOF
 )"
 
     # ----- gateway/run.py -----
-    patch_file "gateway/run.py" "$(cat << 'EOF'
+    patch_file "gateway/run.py" "$(cat <<'EOF'
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -482,27 +482,6 @@
@@ -450,7 +455,7 @@ EOF
 )"
 
     # ----- cron/scheduler.py -----
-    patch_file "cron/scheduler.py" "$(cat << 'EOF'
+    patch_file "cron/scheduler.py" "$(cat <<'EOF'
 --- a/cron/scheduler.py
 +++ b/cron/scheduler.py
 @@ -10,7 +10,6 @@
@@ -465,6 +470,9 @@ EOF
          _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
          _POLL_INTERVAL = 5.0
          _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+-        # Preserve scheduler-scoped ContextVar state (for example skill-declared
+-        # env passthrough registrations) when the cron run hops into the worker
+-        # thread used for inactivity timeout monitoring.
 -        _cron_context = contextvars.copy_context()
 -        _cron_future = _cron_context.run, agent.run_conversation, prompt)
 +        _cron_future = _cron_pool.submit(agent.run_conversation, prompt)
@@ -475,7 +483,7 @@ EOF
 )"
 
     # ----- tools/process_registry.py -----
-    patch_file "tools/process_registry.py" "$(cat << 'EOF'
+    patch_file "tools/process_registry.py" "$(cat <<'EOF'
 --- a/tools/process_registry.py
 +++ b/tools/process_registry.py
 @@ -191,15 +191,9 @@
@@ -492,8 +500,8 @@ EOF
 -                        "user_name": session.watcher_user_name,
 -                        "thread_id": session.watcher_thread_id,
                          "message": (
-                             "Watch patterns disabled for process "
-                             f"{session.id} — too many matches ({session._watch_suppressed} suppressed)."
+                             f"Watch patterns disabled for process {session.id} — "
+                             f"too many matches ({session._watch_suppressed} suppressed). "
                          )
                      })
 @@ -225,17 +219,11 @@
@@ -518,31 +526,41 @@ EOF
 )"
 
     # ----- tools/terminal_tool.py -----
-    patch_file "tools/terminal_tool.py" "$(cat << 'EOF'
+    patch_file "tools/terminal_tool.py" "$(cat <<'EOF'
 --- a/tools/terminal_tool.py
 +++ b/tools/terminal_tool.py
 @@ -1384,10 +1384,14 @@
                  if pty_disabled_reason:
                      result_data["pty_note"] = pty_disabled_reason
 
+-                # Populate routing metadata on the session so that
+-                # watch-pattern and completion notifications can be
+-                # routed back to the correct chat/thread.
 -                if background and (notify_on_complete or watch_patterns):
++                # Mark for agent notification on completion
 +                if notify_on_complete and background:
 +                    proc_session.notify_on_complete = True
 +                    result_data["notify_on_complete"] = True
 +
-+                    if proc_session.watcher_platform:
-                         from gateway.session_context import get_session_env as _gse
-                         _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-                         if _gw_platform:
++                    # In gateway mode, auto-register a fast watcher so the
++                    # gateway can detect completion and trigger a new agent
++                    # turn.  CLI mode uses the completion_queue directly.
+                     from gateway.session_context import get_session_env as _gse
+                     _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                     if _gw_platform:
 @@ -1400,26 +1404,16 @@
                          proc_session.watcher_user_id = _gw_user_id
                          proc_session.watcher_user_name = _gw_user_name
                          proc_session.watcher_thread_id = _gw_thread_id
 -
+-                # Mark for agent notification on completion
 -                if notify_on_complete and background:
 -                    proc_session.notify_on_complete = True
 -                    result_data["notify_on_complete"] = True
 -
+-                    # In gateway mode, auto-register a fast watcher so the
+-                    # gateway can detect completion and trigger a new agent
+-                    # turn.  CLI mode uses the completion_queue directly.
 -                    if proc_session.watcher_platform:
                          proc_session.watcher_interval = 5
                          process_registry.pending_watchers.append({
@@ -566,7 +584,7 @@ EOF
 )"
 
     # ----- tests/cron/test_scheduler.py -----
-    patch_file "tests/cron/test_scheduler.py" "$(cat << 'EOF'
+    patch_file "tests/cron/test_scheduler.py" "$(cat <<'EOF'
 --- a/tests/cron/test_scheduler.py
 +++ b/tests/cron/test_scheduler.py
 @@ -8,8 +8,6 @@
@@ -576,15 +594,128 @@ EOF
 -from tools.env_passthrough import clear_env_passthrough
 -from tools.credential_files import clear_credential_files
 
+
  class TestResolveOrigin:
 @@ -879,117 +877,6 @@
 
+
  class TestRunJobSkillBacked:
 -    def test_run_job_preserves_skill_env_passthrough_into_worker_thread(self, tmp_path):
--        pass
+-        job = {
+-            "id": "skill-env-job",
+-            "name": "skill env test",
+-            "prompt": "Use the skill.",
+-            "skill": "notion",
+-        }
+-
+-        fake_db = MagicMock()
+-
+-        def _skill_view(name):
+-            assert name == "notion"
+-            from tools.env_passthrough import register_env_passthrough
+-
+-            register_env_passthrough(["NOTION_API_KEY"])
+-            return json.dumps({"success": True, "content": "# notion\nUse Notion."})
+-        end
+-
+-        def _run_conversation(prompt):
+-            from tools.env_passthrough import get_all_passthrough
+-
+-            assert "NOTION_API_KEY" in get_all_passthrough()
+-            return {"final_response": "ok"}
+-        end
+-
+-        with patch("cron.scheduler._hermes_home", tmp_path), \
+-             patch("cron.scheduler._resolve_origin", return_value=None), \
+-             patch("dotenv.load_dotenv"), \
+-             patch("hermes_state.SessionDB", return_value=fake_db), \
+-             patch(
+-                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+-                 return_value={
+-                     "api_key": "***",
+-                     "base_url": "https://example.invalid/v1",
+-                     "provider": "openrouter",
+-                     "api_mode": "chat_completions",
+-                 },
+-             ), \
+-             patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
+-             patch("run_agent.AIAgent") as mock_agent_cls:
+-            mock_agent = MagicMock()
+-            mock_agent.run_conversation.side_effect = _run_conversation
+-            mock_agent_cls.return_value = mock_agent
+-
+-            try:
+-                success, output, final_response, error = run_job(job)
+-            finally:
+-                clear_env_passthrough()
+-
+-        assert success is True
+-        assert error is None
+-        assert final_response == "ok"
+-    end
 -
 -    def test_run_job_preserves_credential_file_passthrough_into_worker_thread(self, tmp_path):
--        pass
+-        """copy_context() also propagates credential_files ContextVar."""
+-        job = {
+-            "id": "cred-env-job",
+-            "name": "cred file test",
+-            "prompt": "Use the skill.",
+-            "skill": "google-workspace",
+-        }
+-
+-        fake_db = MagicMock()
+-
+-        # Create a credential file so register_credential_file succeeds
+-        cred_dir = tmp_path / "credentials"
+-        cred_dir.mkdir()
+-        (cred_dir / "google_token.json").write_text('{"token": "***"}')
+-
+-        def _skill_view(name):
+-            assert name == "google-workspace"
+-            from tools.credential_files import register_credential_file
+-
+-            register_credential_file("credentials/google_token.json")
+-            return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
+-        end
+-
+-        def _run_conversation(prompt):
+-            from tools.credential_files import _get_registered
+-
+-            registered = _get_registered()
+-            assert registered, "credential files must be visible in worker thread"
+-            assert any("google_token.json" in v for v in registered.values())
+-            return {"final_response": "ok"}
+-        end
+-
+-        with patch("cron.scheduler._hermes_home", tmp_path), \
+-             patch("cron.scheduler._resolve_origin", return_value=None), \
+-             patch("tools.credential_files._resolve_hermes_home", return_value=tmp_path), \
+-             patch("dotenv.load_dotenv"), \
+-             patch("hermes_state.SessionDB", return_value=fake_db), \
+-             patch(
+-                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+-                 return_value={
+-                     "api_key": "***",
+-                     "base_url": "https://example.invalid/v1",
+-                     "provider": "openrouter",
+-                     "api_mode": "chat_completions",
+-                 },
+-             ), \
+-             patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
+-             patch("run_agent.AIAgent") as mock_agent_cls:
+-            mock_agent = MagicMock()
+-            mock_agent.run_conversation.side_effect = _run_conversation
+-            mock_agent_cls.return_value = mock_agent
+-
+-            try:
+-                success, output, final_response, error = run_job(job)
+-            finally:
+-                clear_credential_files()
+-
+-        assert success is True
+-        assert error is None
+-        assert final_response == "ok"
+-    end
      def test_run_job_loads_skill_and_disables_recursive_cron_tools(self, tmp_path):
          job = {
              "id": "skill-job",
@@ -592,7 +723,7 @@ EOF
 )"
 
     # ----- tests/gateway/test_background_process_notifications.py -----
-    patch_file "tests/gateway/test_background_process_notifications.py" "$(cat << 'EOF'
+    patch_file "tests/gateway/test_background_process_notifications.py" "$(cat <<'EOF'
 --- a/tests/gateway/test_background_process_notifications.py
 +++ b/tests/gateway/test_background_process_notifications.py
 @@ -14,7 +14,7 @@
@@ -601,6 +732,7 @@ EOF
  from gateway.config import GatewayConfig, Platform
 -from gateway.run import GatewayRunner, _parse_session_key
 +from gateway.run import GatewayRunner
+
 
  # ---------------------------------------------------------------------------
 @@ -45,7 +45,7 @@
@@ -620,14 +752,66 @@ EOF
 )"
 
     # ----- tests/gateway/test_internal_event_bypass_pairing.py -----
-    patch_file "tests/gateway/test_internal_event_bypass_pairing.py" "$(cat << 'EOF'
+    patch_file "tests/gateway/test_internal_event_bypass_pairing.py" "$(cat <<'EOF'
 --- a/tests/gateway/test_internal_event_bypass_pairing.py
 +++ b/tests/gateway/test_internal_event_bypass_pairing.py
 @@ -231,59 +231,6 @@
 
+
  @pytest.mark.asyncio
 -async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monkeypatch, tmp_path):
--    pass
+-    import tools.process_registry as pr_module
+-    from gateway.session import SessionSource
+-
+-    sessions = [
+-        SimpleNamespace(
+-            output_buffer="done\n", exited=True, exit_code=0, command="echo test"
+-        ),
+-    ]
+-    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+-
+-    async def _instant_sleep(*_a, **_kw):
+-        pass
+-    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+-
+-    runner = GatewayRunner(GatewayConfig())
+-    adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+-    runner.adapters[Platform.TELEGRAM] = adapter
+-    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+-        origin=SessionSource(
+-            platform=Platform.TELEGRAM,
+-            chat_id="-100",
+-            chat_type="group",
+-            thread_id="42",
+-            user_id="user-42",
+-            user_name="alice",
+-        )
+-    )
+-
+-    watcher = {
+-        "session_id": "proc_test_internal",
+-        "check_interval": 0,
+-        "session_key": "agent:main:telegram:group:-100:42",
+-        "platform": "telegram",
+-        "chat_id": "-100",
+-        "thread_id": "42",
+-        "notify_on_complete": True,
+-    }
+-
+-    await runner._run_process_watcher(watcher)
+-
+-    assert adapter.handle_message.await_count == 1
+-    event = adapter.handle_message.await_args.args[0]
+-    assert event.internal is True
+-    assert event.source.platform == Platform.TELEGRAM
+-    assert event.source.chat_id == "-100"
+-    assert event.source.chat_type == "group"
+-    assert event.source.thread_id == "42"
+-    assert event.source.user_id == "user-42"
+-    assert event.source.user_name == "alice"
+-
+-
+ @pytest.mark.asyncio
  async def test_none_user_id_skips_pairing(monkeypatch, tmp_path):
      """A non-internal event with user_id=None should be silently dropped."""
      import gateway.run as gateway_run
@@ -635,7 +819,7 @@ EOF
 )"
 
     # ----- tests/tools/test_watch_patterns.py -----
-    patch_file "tests/tools/test_watch_patterns.py" "$(cat << 'EOF'
+    patch_file "tests/tools/test_watch_patterns.py" "$(cat <<'EOF'
 --- a/tests/tools/test_watch_patterns.py
 +++ b/tests/tools/test_watch_patterns.py
 @@ -92,25 +92,6 @@
@@ -643,7 +827,23 @@ EOF
          assert evt["session_id"] == "proc_test_watch"
 
 -    def test_match_carries_session_key_and_watcher_routing_metadata(self, registry):
--        pass
+-        session = _make_session(watch_patterns=["ERROR"])
+-        session.session_key = "agent:main:telegram:group:-100:42"
+-        session.watcher_platform = "telegram"
+-        session.watcher_chat_id = "-100"
+-        session.watcher_user_id = "u123"
+-        session.watcher_user_name = "alice"
+-        session.watcher_thread_id = "42"
+-
+-        registry._check_watch_patterns(session, "ERROR: disk full\n")
+-        evt = registry.completion_queue.get_nowait()
+-
+-        assert evt["session_key"] == "agent:main:telegram:group:-100:42"
+-        assert evt["platform"] == "telegram"
+-        assert evt["chat_id"] == "-100"
+-        assert evt["user_id"] == "u123"
+-        assert evt["user_name"] == "alice"
+-        assert evt["thread_id"] == "42"
 -
      def test_multiple_patterns(self, registry):
          """First matching pattern is reported."""
@@ -656,7 +856,7 @@ EOF
 }
 
 # =============================================================================
-# Step 4: 重新安装 Python 包
+# Step 4: 重新安装 Python 包（确保 __pycache__ 一致）
 # =============================================================================
 reinstall_package() {
     local target_dir="${1:-$HOME/.hermes/hermes-agent}"
@@ -679,6 +879,7 @@ reinstall_package() {
 main() {
     print_banner
 
+    # Step 1: 官方安装
     run_official_install "$@"
     install_exit=$?
 
@@ -687,7 +888,10 @@ main() {
         exit $install_exit
     fi
 
+    # Step 2: 应用修复
     apply_fixes
+
+    # Step 3: 重新安装 Python 包
     reinstall_package
 
     echo ""
@@ -697,7 +901,7 @@ main() {
     echo "└─────────────────────────────────────────────────────────┘"
     echo -e "${NC}"
     echo ""
-    echo "使用方式："
+    echo "使用方式与官方完全一致："
     echo "  hermes              开始对话"
     echo "  hermes setup        配置"
     echo "  hermes gateway      启动网关（含钉钉）"
