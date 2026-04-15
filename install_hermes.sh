@@ -6,7 +6,7 @@
 #
 # 用法（与官方完全一致）:
 #   curl -fsSL https://raw.githubusercontent.com/<YOUR_GIST_OR_REPO>/main/scripts/install.sh | bash
-#
+#   curl -fsSL  https://raw.githubusercontent.com/jeikl/hermes-dingtalk-fix-script/refs/heads/master/install_hermes.sh | bash
 # 或者下载到本地运行:
 #   chmod +x install_hermes.sh && ./install_hermes.sh
 # =============================================================================
